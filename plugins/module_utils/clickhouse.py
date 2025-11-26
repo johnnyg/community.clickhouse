@@ -147,3 +147,112 @@ def get_server_version(module, client):
         version["type"] = None
 
     return version
+
+
+class ClickHouseCreateAlterDropType:
+    _type = None
+
+    def __init__(self, module, client, name):
+        self.module = module
+        self.client = client
+        self.name = name
+        self.executed_statements = []
+        self.exists = self._check_exists()
+
+    def _check_exists(self):
+        query = f"SELECT 1 FROM system.{self._type.lower()}s WHERE name = '{self.name}' LIMIT 1"
+        result = execute_query(self.module, self.client, query)
+        return bool(result)
+
+    def _get_create_statement(self):
+        """Get current definition using SHOW CREATE X"""
+        if not self.exists:
+            return None
+
+        query = f"SHOW CREATE {self._type} {self.name}"
+        result = execute_query(self.module, self.client, query)
+        if result:
+            return result[0][0]  # SHOW CREATE X returns single row with CREATE statement
+        return None
+
+    def _params_match(self, create_statement):
+        """Parse CREATE X statement"""
+        raise NotImplementedError
+
+    def _needs_altering(self):
+        """Check if we need to alter to reach desired"""
+        create_statement = self._get_create_statement()
+        return create_statement is None or not self._params_match(create_statement)
+
+    def _create_sql_clauses(self, action):
+        clauses = [f"{action} {self._type} {self.name}"]
+
+        cluster = self.module.params['cluster']
+        if cluster:
+            clauses.append(f"ON CLUSTER {cluster}")
+
+        return clauses
+
+    def _do(self, action):
+        if action not in ("CREATE", "ALTER"):
+            raise ValueError(f"Expected action to be create or alter but got '{action}'")
+
+        query = " ".join(self._create_sql_clauses(action))
+
+        self.executed_statements.append(query)
+
+        if not self.module.check_mode:
+            execute_query(self.module, self.client, query)
+
+    def create(self):
+        """
+        Create entity using CREATE X
+        Returns whether the entity was created or not
+        """
+        if self.exists:
+            return False
+
+        self._do("CREATE")
+        self.exists = True
+        return True
+
+    def alter(self):
+        """
+        Update entity using ALTER X if it needs it
+        Returns whether the entity was altered or not
+        """
+        if not self.exists or not self._needs_altering():
+            return False
+
+        self._do("ALTER")
+        return True
+
+    def drop(self):
+        """Drop entity using DROP X"""
+        if not self.exists:
+            return False
+
+        query = f"DROP {self._type} {self.name}"
+        self.executed_statements.append(query)
+
+        if not self.module.check_mode:
+            execute_query(self.module, self.client, query)
+
+        self.exists = False
+        return True
+
+class ClickHousePresentAbsentType(ClickHouseCreateAlterDropType):
+    def ensure_state(self):
+        state = self.module.params['state']
+        if state not in ("present", "absent"):
+            raise ValueError(f"Unexpeced state '{state}'")
+        
+        if state == "present":
+            # create or alter role
+            # will do nothing is nothing needs to be done
+            changed = self.create() or self.alter()
+        else:
+            # drop if exists
+            changed = self.drop()
+
+        return changed

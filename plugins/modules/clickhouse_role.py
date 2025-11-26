@@ -97,35 +97,13 @@ from ansible_collections.community.clickhouse.plugins.module_utils.clickhouse im
     check_clickhouse_driver,
     client_common_argument_spec,
     connect_to_db_via_client,
-    execute_query,
     get_main_conn_kwargs,
+    ClickHousePresentAbsentType,
 )
 
-executed_statements = []
 
-
-class ClickHouseRole:
-    def __init__(self, module, client, name):
-        self.module = module
-        self.client = client
-        self.name = name
-        self.exists = self.check_exists()
-
-    def check_exists(self):
-        query = "SELECT 1 FROM system.roles WHERE name = '%s' LIMIT 1" % self.name
-        result = execute_query(self.module, self.client, query)
-        return bool(result)
-
-    def get_current_role_definition(self):
-        """Get current role definition using SHOW CREATE ROLE"""
-        if not self.exists:
-            return None
-
-        query = "SHOW CREATE ROLE %s" % self.name
-        result = execute_query(self.module, self.client, query)
-        if result:
-            return result[0][0]  # SHOW CREATE ROLE returns single row with CREATE statement
-        return None
+class ClickHouseRole(ClickHousePresentAbsentType):
+    _type = "ROLE"
 
     def parse_settings_from_create_statement(self, create_statement):
         """Parse settings from CREATE ROLE statement"""
@@ -213,69 +191,20 @@ class ClickHouseRole:
 
         return current_normalized != desired_normalized
 
-    def create(self):
-        if not self.exists:
-            query = "CREATE ROLE %s" % self.name
-
-            if self.module.params['cluster']:
-                query += " ON CLUSTER %s" % self.module.params['cluster']
-
-            list_settings = self.module.params['settings']
-            if list_settings:
-                query += " SETTINGS"
-                for index, value in enumerate(list_settings):
-                    query += " %s" % value
-                    if index < len(list_settings) - 1:
-                        query += ","
-
-            executed_statements.append(query)
-
-            if not self.module.check_mode:
-                execute_query(self.module, self.client, query)
-
-            self.exists = True
+    def _params_match(self, create_statement):
+        desired_settings = self.module.params.get("settings", [])
+        if not desired_settings:
             return True
-        else:
-            return False
+        current_settings = self.parse_settings_from_create_statement(create_statement)
+        return not self.settings_changed(current_settings, desired_settings)
 
-    def alter(self, settings):
-        """Update role settings using ALTER ROLE"""
-        if not self.exists:
-            return False
-
-        query = "ALTER ROLE %s" % self.name
-
-        if self.module.params['cluster']:
-            query += " ON CLUSTER %s" % self.module.params['cluster']
-
-        # Handle settings updates
-        if settings is not None and len(settings) > 0:
-            # Set these settings
-            query += " SETTINGS"
-            for index, value in enumerate(settings):
-                query += " %s" % value
-                if index < len(settings) - 1:
-                    query += ","
-
-        executed_statements.append(query)
-
-        if not self.module.check_mode:
-            execute_query(self.module, self.client, query)
-
-        return True
-
-    def drop(self):
-        if self.exists:
-            query = "DROP ROLE %s" % self.name
-            executed_statements.append(query)
-
-            if not self.module.check_mode:
-                execute_query(self.module, self.client, query)
-
-            self.exists = False
-            return True
-        else:
-            return False
+    def _create_sql_clauses(self, action):
+        sql_clauses = super()._create_sql_clauses(action)
+        list_settings = self.module.params["settings"]
+        if list_settings:
+            sql_clauses.append("SETTINGS")
+            sql_clauses.append(", ".join(str(setting) for setting in list_settings))
+        return sql_clauses
 
 
 def main():
@@ -314,32 +243,14 @@ def main():
     client = connect_to_db_via_client(module, main_conn_kwargs, client_kwargs)
 
     # Do the job
-    changed = False
     role = ClickHouseRole(module, client, name)
-    desired_settings = module.params.get("settings", [])
-
-    if state == "present":
-        if not role.exists:
-            # Role doesn't exist, create it
-            changed = role.create()
-        else:
-            # Role exists, check if settings need to be updated
-            if desired_settings is not None and len(desired_settings) > 0:  # Only check settings if they are specified and not empty
-                current_definition = role.get_current_role_definition()
-                current_settings = role.parse_settings_from_create_statement(current_definition) if current_definition else []
-
-                if role.settings_changed(current_settings, desired_settings):
-                    changed = role.alter(desired_settings)
-    else:
-        # If state is absent
-        if role.exists:
-            changed = role.drop()
+    changed = role.ensure_state()
 
     # Close connection
     client.disconnect_connection()
 
     # Users will get this in JSON output after execution
-    module.exit_json(changed=changed, executed_statements=executed_statements)
+    module.exit_json(changed=changed, executed_statements=role.executed_statements)
 
 
 if __name__ == "__main__":
